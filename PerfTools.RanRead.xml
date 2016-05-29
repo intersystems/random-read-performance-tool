@@ -1,0 +1,713 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25">
+<Class name="PerfTools.RanRead">
+<Description>
+This tool persists random read storage IO performance statistics for analysis.
+The goal of this tool is to drive as many jobs as possible to achieve target  
+IOPS and ensure acceptable disk response times are also sustained.  
+Data is stored by date and time to support queries over time.
+This utility requires the ability to run in %SYS with RW.
+For more info run:  do ##class(PerfTools.RanRead).Help()</Description>
+<IncludeCode>%occInclude</IncludeCode>
+<Super>%Persistent</Super>
+<TimeCreated>64054,57617.929379</TimeCreated>
+
+<Parameter name="EXPORTFILENAME">
+<Default>PerfToolsRanRead_</Default>
+</Parameter>
+
+<Parameter name="FILEEXTENSION">
+<Default>.txt</Default>
+</Parameter>
+
+<Parameter name="DELIM">
+<Expression>$char(9)</Expression>
+</Parameter>
+
+<Parameter name="TIMEDECIMAL">
+<Default>3</Default>
+</Parameter>
+
+<Property name="RunDate">
+<Description>
+Date this run was started
+RunDate and RunTime uniquely identify a run</Description>
+<Type>%Date</Type>
+</Property>
+
+<Property name="RunTime">
+<Description>
+Time this run was started
+RunDate and RunTime uniquely identify a run</Description>
+<Type>%Time</Type>
+</Property>
+
+<Property name="Batch">
+<Description>
+Run number</Description>
+<Type>%Integer</Type>
+</Property>
+
+<Property name="Database">
+<Description>
+Database directory used for the random read test</Description>
+<Type>%String</Type>
+</Property>
+
+<Property name="Processes">
+<Description>
+Number of processes</Description>
+<Type>%Integer</Type>
+</Property>
+
+<Property name="Job">
+<Description>
+Job number</Description>
+<Type>%Integer</Type>
+</Property>
+
+<Property name="Iterations">
+<Description>
+Number of iterations</Description>
+<Type>%Integer</Type>
+</Property>
+
+<Property name="ResponseTime">
+<Description>
+Response Time in milliseconds</Description>
+<Type>%String</Type>
+</Property>
+
+<Property name="IOPS">
+<Description>
+Calculated IOPS (1000ms / Processes * Response Time)</Description>
+<Type>%Integer</Type>
+</Property>
+
+<Method name="Help">
+<Description>
+Display help</Description>
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	#dim str as %String
+	
+	// write display title
+	do ..DisplayTitle()
+	set str=..#DELIM_"- "
+	write !,"do ##class(PerfTools.RanRead).Setup(Directory,DatabaseName,SizeGB,LogLevel)"
+	write !,str_"Creates database and namespace with the same name. The log level must be in the range of 0 to 3, where 0 is “none” and 3 is “verbose”."
+	write !,"do ##class(PerfTools.RanRead).Run(Directory,Processes,Iterations)"
+	write !,str_"Run the random read IO test."
+	write !,"do ##class(PerfTools.RanRead).Stop()"
+	write !,str_"Terminates all background jobs."
+	write !,"do ##class(PerfTools.RanRead).Reset()"
+	write !,str_"Deletes all random read history stored in ^PerfTools.RanRead* globals."
+	write !,"do ##class(PerfTools.RanRead).DeleteNSDatabase(Namespace)"
+	write !,str_"Deletes namespace and database of the same name."
+	write !,"do ##class(PerfTools.RanRead).Export(directory)"
+	write !,str_"Exports a summary of all random read test history to tab delimited text file."
+]]></Implementation>
+</Method>
+
+<Method name="Run">
+<Description>
+Run random read test. 
+Prompt user for database path, processes and iterations if not passed in.</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String="",pProcesses:%Integer=1,pIterations:%Integer=1000</FormalSpec>
+<Implementation><![CDATA[
+	
+	#dim tSC as %Status = $$$OK
+	#dim directory,db as %String
+	#dim h,date,time as %String
+	#dim i,batch,maxBlock,currentJobs,IOPS as %Integer
+	#dim respTime as %Double
+
+	try {
+		//Normalize directory
+		set directory=##class(%Library.File).NormalizeDirectory(pDirectory)
+
+		//Check if database exists
+		if ..IsValidDatabaseDir(directory)  {
+			
+			// write display title
+			do ..DisplayTitle()
+			
+			//Get database properties
+			set db=##Class(SYS.Database).%OpenId(directory)
+			set maxBlock=(db.Size*1024*1024)/db.BlockSize
+			//write !,"Database: "_db.Directory
+			
+			//Each run is identified by the start date / time to keep related items together.
+			set h=$horolog
+			set date=+h
+			set time=$piece(h,",",2)
+			set batch=$increment(^PerfTools.RanRead("BATCH"))
+			
+			//Set run flag
+			set ^PerfTools.RanRead("RUNSTATUS")=$$$OK
+			
+			if pProcesses = 1 {
+				write !,"Starting "_pIterations_" random reads."
+				//If only one process then run in the foreground. 
+				$$$TOE(tSC,..RandReadJob(date,time,batch,directory,pProcesses,pIterations,maxBlock,1))
+				write !,"Tested OK."
+				
+			} else {
+				write !,"Starting "_pProcesses_" jobs in the background."	
+				write !,"To terminate jobs run:  do ##class(PerfTools.RanRead).Stop()"
+				
+				
+				//For each process
+				for i=1:1:pProcesses {
+					//Job off separate processes to perform random read test
+					job ..RandReadJob(date,time,batch,directory,pProcesses,pIterations,maxBlock,i)
+				}
+				
+				write !,"Waiting for jobs to finish."
+				//Loop while background jobs are running
+				do {
+					set currentJobs=..CountJobs()
+					hang 1
+					write "."
+				
+				} while currentJobs>0
+						
+				write !,"Random read background jobs finished."
+				
+				//Get average response time
+				set respTime=..GetAverageResponseTime(batch)
+				write !,pProcesses_" processes ("_pIterations_" iterations) average response time = "_respTime_"ms"
+				set IOPS=1000/respTime*pProcesses
+				write !,"Calculated IOPS = "_$number(IOPS,0)
+
+			}
+			
+			//Reset run flag
+			set ^PerfTools.RanRead("RUNSTATUS")=0
+				
+		} else {
+			write !,"ERROR: Directory not valid. See below for parameters."
+			write !,"do ##class(PerfTools.RanRead).Run(Directory,Processes,Iterations)"
+		}
+		
+	} catch errObj {
+		set tSC = errObj.AsStatus()
+		do errObj.Log()
+		do $system.OBJ.DisplayError(tSC)
+	}
+]]></Implementation>
+</Method>
+
+<Method name="RandReadJob">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDate:%Date,pTime:%Time,pBatch:%Integer,pDirectory:%String,pProcesses:%Integer,pIterations:%Integer,pMaxBlocks:%Integer,pJobNum:%Integer</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	
+	#dim db as %String
+	#dim i as %Integer
+	#dim startTime,endTime,respTime,elapseTime as %String
+	
+	try {
+		//Setup background jobs counter
+		set ^PerfTools.RanRead("JOBS",(pJobNum))=$j
+		
+		//Add prefix to database directory 
+		set db="^^"_pDirectory
+		
+		set startTime=$ztimestamp
+		for i=1:1:pIterations {
+			//Open the database using the View Buffer
+			open 63:db
+			//Use the VIEW block form to read in a random block from the database
+			view $random(pMaxBlocks)
+			close 63
+			//Exit loop if requested to terminate all jobs
+			quit:^PerfTools.RanRead("RUNSTATUS")=0
+		}
+		set endTime=$ztimestamp
+		set elapseTime=$p(endTime,",",2)-$p(startTime,",",2)
+		set respTime=(elapseTime/pIterations)*1000
+		set respTime=$number(respTime,..#TIMEDECIMAL)
+		
+		//If only one process then display message in foreground
+		if pProcesses=1 {
+			write !,"Start "_startTime
+			write !,"End "_endTime
+			write !,"Response Time "_respTime_"ms"
+		}	
+		
+		//Save job info
+		set tObj=..%New()
+		set tObj.RunDate=pDate
+		set tObj.RunTime=pTime
+		set tObj.Batch=pBatch
+		set tObj.Database=pDirectory
+		set tObj.Iterations=pIterations
+		set tObj.Processes=pProcesses
+		set tObj.Job=pJobNum
+		set tObj.ResponseTime=respTime
+		set tObj.IOPS=1000/respTime*pProcesses
+		
+		$$$TOE(tSC,tObj.%Save())
+			
+	} catch errObj {
+		set tSC = errObj.AsStatus()
+		do errObj.Log()
+		do $system.OBJ.DisplayError(tSC)
+	}
+	
+	//Clean up job counter
+	kill ^PerfTools.RanRead("JOBS",(pJobNum))
+	
+	quit tSC
+]]></Implementation>
+</Method>
+
+<Query name="ExportSummary">
+<Description>
+SQL Query returns summary </Description>
+<Type>%SQLQuery</Type>
+<SqlQuery>	SELECT RunDate,RunTime,Database,Iterations,Processes,
+	{fn ROUND(AVG(ResponseTime),2)} As ResponseTime,
+	{fn ROUND(AVG(IOPS),0)} As IOPS
+	FROM PerfTools.RanRead
+	GROUP BY Batch</SqlQuery>
+</Query>
+
+<Method name="Export">
+<Description>
+Export all test history to tab delimited text file</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+		
+	#dim tSC as %Status = $$$OK
+
+	try {
+
+		//Check if directory exists
+		if ##class(%Library.File).DirectoryExists(pDirectory) {
+					
+			set pathFilename=..GetPathFileName(pDirectory)		
+					
+			if pathFilename'=""	{
+				
+				write !,"Exporting summary of all random read statistics to "_pathFilename
+				
+				//Open file
+				set file = ##class(%File).%New(pathFilename)
+				$$$TOE(tSC,file.Open("WNS"))
+				
+				//Execute SQL query
+				set rs=##class(%ResultSet).%New("PerfTools.RanRead:ExportSummary")
+				$$$TOE(tSC,rs.Execute())
+
+				//Write the headers
+				set colCount=rs.GetColumnCount()
+				for col=1:1:colCount {
+					do file.Write(rs.GetColumnName(col)_..#DELIM)
+					set type(col)=rs.GetColumnType(col)
+				}
+				do file.WriteLine()
+				
+				//Loop through all rows and write out to tab delimited txt file.
+				while rs.Next() {
+					for col=1:1:colCount {
+						
+						//Get field type
+						set type=type(col)
+						set data=rs.GetData(col)
+						if type=2 {  //DATE // region agnostic YYYY-MM-DD format
+							do file.Write($zdate(data,3)_..#DELIM)
+						} else {
+							if type=8 {//TIME// 24 hours HH:MM:SS format
+								do file.Write($ztime(data,1)_..#DELIM)
+							} else {
+								do file.Write(data_..#DELIM)
+							}
+						}
+					}
+					do file.WriteLine()
+				}
+				//Close file
+				do file.Close()
+				
+				write !,"Done."
+			}
+			
+		} else {
+		 	set tSC=$$$ERROR($$$DirectoryNameInvalid,"Directory="_pDirectory)
+		 	do $system.OBJ.DisplayError(tSC)
+		}
+
+	} catch errObj {
+		set tSC = errObj.AsStatus()
+		do errObj.Log()
+		do $system.OBJ.DisplayError(tSC)
+	}
+	
+	quit tSC
+]]></Implementation>
+</Method>
+
+<Method name="GetPathFileName">
+<Description>
+Get full directory filename for export summary txt file.</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	//Normalize directory
+	set directory=##class(%Library.File).NormalizeDirectory(pDirectory)		
+	//Get filename
+	set h=$horolog
+	//Get date in format yyyymmdd
+	set date=$zdatetime(+h,8)
+	//Get time in format hhdd
+	set time=$replace($ztime($piece(h,",",2),2),":","")
+	set filename=..#EXPORTFILENAME_date_"-"_time_..#FILEEXTENSION
+	set pathFilename=##class(%File).NormalizeFilename(filename,directory)
+	
+	quit pathFilename
+]]></Implementation>
+</Method>
+
+<Method name="GetAverageResponseTime">
+<Description>
+Return average response time for specified batch run</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pBatch:%Integer</FormalSpec>
+<ReturnType>%Double</ReturnType>
+<Implementation><![CDATA[
+	#dim avgTime as %Double = 0
+	
+	//Get average response time
+	&sql(SELECT AVG(ResponseTime) 
+		INTO :avgTime
+		FROM PerfTools.RanRead
+		WHERE Batch=:pBatch)
+	
+	set avgTime=$number(avgTime,..#TIMEDECIMAL)	
+	
+	quit avgTime
+]]></Implementation>
+</Method>
+
+<Method name="CountJobs">
+<Description>
+Return number of background jobs running</Description>
+<ClassMethod>1</ClassMethod>
+<ReturnType>%Integer</ReturnType>
+<Implementation><![CDATA[
+	#dim job as %Integer
+	#dim jobCount as %Integer = 0
+	
+	//Loop through background job counter
+	set job=$order(^PerfTools.RanRead("JOBS",("")))
+	while (job'="") {
+    	//Increment job counter	
+    	set jobCount=jobCount+1
+     	//Get next job 
+		set job = $order(^PerfTools.RanRead("JOBS",(job)))
+   	}
+
+   	quit jobCount
+]]></Implementation>
+</Method>
+
+<Method name="Setup">
+<Description>
+Create database and namespace for random read test</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String="",pDBname:%String="ZRANDREAD",pSizeGB:%Integer=1,pLogLevel:%Integer=1</FormalSpec>
+<Implementation><![CDATA[
+ 	
+ 	#dim tSC as %Status = $$$OK
+ 	#dim directory,dbName,freeSpace,totalSpace as %String = ""
+	#dim vars as Array of %String = "" 
+	#dim dbObj as %ObjectHandle
+	
+	try {
+		
+		//Normalize directory
+		set directory=##class(%Library.File).NormalizeDirectory(pDirectory)
+	
+		//Check if database and directory exist
+		if ..SetupDatabaseDirectory(directory,pDBname) {
+			
+			//Convert database name to UPPER case
+			set dbName=$zconvert(pDBname,"U")
+			
+			//Get availble free disk space in GB
+			$$$TOE(tSC,##class(%Library.File).GetDirectorySpace(directory,.freeSpace,.totalSpace,2))
+			
+			//Convert GB to MB
+			set sizeMB=pSizeGB*1024
+			
+			//If there is enough disk space then create database
+			if freeSpace>pSizeGB {
+				
+				//Setup up variables for %Installer manifest
+				set vars("dbName")=dbName
+				set vars("DIRECTORY")=directory
+				set vars("SIZEMB")=sizeMB
+				
+				//Create pre-expanded CACHE.DAT here because InitialSize in the manifest does not compile when using a variable - ERROR #6260 Datatype validation failed.
+				write !,"Creating "_pSizeGB_"GB database in "_directory
+				set dbObj=##Class(SYS.Database).%New()
+				set dbObj.Directory=directory
+				set dbObj.Size=sizeMB
+				$$$TOE(tSC,dbObj.%Save())
+				write !,"Database created in "_directory
+			
+				//Run manifest to create database and namespace
+				write !,"Run %Installer Manifest...",!
+ 				$$$TOE(tSC,..RunManifestRandRead(.vars,pLogLevel))
+				
+				write !,"Database "_directory_" ready for testing."
+				//Display commands to run
+				write !,"do ##class(PerfTools.RanRead).Run(directory,processes,iterations) e.g."
+				write !,"do ##class(PerfTools.RanRead).Run("""_pDirectory_""",1,10000)"
+				
+			} else {
+				write !,"ERROR: Database size ("_pSizeGB_"GB) cannot be greater than available freeSpace ("_freeSpace_"GB)"
+
+			}
+		}
+	} 
+	catch errObj {
+		set tSC = errObj.AsStatus()
+		do errObj.Log()
+		do $system.OBJ.DisplayError(tSC)
+	}
+]]></Implementation>
+</Method>
+
+<XData name="ManifestRandRead">
+<Description>
+Manifest Definition</Description>
+<XMLNamespace>INSTALLER</XMLNamespace>
+<Data><![CDATA[
+<Manifest>
+
+<!-- Configure namespace -->
+<Namespace Name="${dbName}" Create="yes" Code="${dbName}" Data="${dbName}">
+
+<Configuration>
+
+<!-- Configure database -->
+<Database Name="${dbName}" Create="no" Dir="${DIRECTORY}" MountAtStartup="true" MountRequired="true"/>
+
+</Configuration>
+
+</Namespace>
+</Manifest>
+]]></Data>
+</XData>
+
+<Method name="RunManifestRandRead">
+<Description>
+This is a method generator whose code is generated by XGL.</Description>
+<Internal>1</Internal>
+<ClassMethod>1</ClassMethod>
+<CodeMode>objectgenerator</CodeMode>
+<FormalSpec><![CDATA[&pVars,pLogLevel:%Integer=3,pInstaller:%Installer.Installer,pLogger:%Installer.AbstractLogger]]></FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	#; Let our XGL document generate code for this method.
+ 	Quit ##class(%Installer.Manifest).%Generate(%compiledclass, %code, "ManifestRandRead")
+]]></Implementation>
+</Method>
+
+<Method name="IsValidDatabaseDir">
+<Description>
+Return true if database directory is valid</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	#dim found as %Boolean = '$$$OK
+	#dim dbDir as %String
+	#dim rs as %ObjectHandle
+
+	//If directory exists
+	if ##class(%Library.File).DirectoryExists(pDirectory) {
+		//Loop through all databases
+		set rs=##class(%Library.ResultSet).%New("Config.Databases:LocalDatabaseList")
+		do rs.Execute("*")
+		while rs.Next() {
+			set dbDir=rs.Data("Directory")
+			set dbDir=##class(%Library.File).NormalizeDirectory(dbDir)
+			//If directory exists
+			if pDirectory=dbDir {
+				set found=$$$OK
+				quit
+			}
+		}
+	}
+
+	quit found
+]]></Implementation>
+</Method>
+
+<Method name="SetupDatabaseDirectory">
+<Description>
+Create database directory if it doesn't exist then check if a database already exists.</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pDirectory:%String,pName:%String</FormalSpec>
+<ReturnType>%Boolean</ReturnType>
+<Implementation><![CDATA[
+	#dim directoryOK as %Boolean = $$$OK
+	#dim objDB as %Object = ""
+
+	if ##class(Config.DBName).IsValid(pName) {
+
+		//If directory exists
+		if ##class(%Library.File).DirectoryExists(pDirectory)  {
+			 
+			//Check if database exists
+			if ##Class(Config.Databases).Exists(pName,.objDB) {
+				write !,"ERROR: Database already exists."
+				set directoryOK='$$$OK
+			}
+		
+		} else {
+			//Create directory
+			if ##class(%Library.File).CreateDirectoryChain(pDirectory) {
+				write !,"Created directory "_pDirectory
+			} else {
+				write !,"ERROR: Could not create directory."
+				set directoryOK='$$$OK
+			}
+		}
+	} else {
+		write !,"ERROR: Database name is invalid."
+		set directoryOK='$$$OK	
+	}
+	quit directoryOK
+]]></Implementation>
+</Method>
+
+<Method name="DisplayTitle">
+<Description>
+Display header</Description>
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	write !,"InterSystems Random Read IO Performance Tool"
+	write !,"--------------------------------------------"
+]]></Implementation>
+</Method>
+
+<Method name="Stop">
+<Description>
+Set the stop flag to terminate all background jobs.</Description>
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[	set ^PerfTools.RanRead("RUNSTATUS")='$$$OK
+]]></Implementation>
+</Method>
+
+<Method name="Reset">
+<Description>
+Delete all RandRead data</Description>
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	kill ^PerfTools.RanReadD
+	kill ^PerfTools.RanRead
+]]></Implementation>
+</Method>
+
+<Method name="DeleteNSDatabase">
+<Description>
+Delete namespace and database</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>pName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	#dim tSC as %Status = $$$OK
+	#dim properties as %String = ""
+	#dim directory as %String = ""
+	
+	try {
+		
+		//Delete namespace
+		$$$TOE(tSC,##class(Config.Namespaces).Delete(pName))
+		write !,"Deleted namespace "_pName
+		
+		//Get database configuration properties
+		$$$TOE(tSC,##Class(Config.Databases).Get(pName,.properties))
+		
+		//Get database directory
+		set directory=properties("Directory")
+		
+		//Delete database configuration
+		$$$TOE(tSC,##Class(Config.Databases).Delete(pName))
+		
+		//Delete database
+		$$$TOE(tSC,##Class(SYS.Database).DeleteDatabase(directory))
+		write !,"Deleted database "_directory
+		
+	} catch errObj {
+		do errObj.Log()
+		set tSC = errObj.AsStatus()
+		do $system.OBJ.DisplayError(tSC)
+
+	}
+	
+	quit tSC
+]]></Implementation>
+</Method>
+
+<Storage name="Default">
+<Type>%Library.CacheStorage</Type>
+<DataLocation>^PerfTools.RanReadD</DataLocation>
+<DefaultData>RandReadDefaultData</DefaultData>
+<IdLocation>^PerfTools.RanReadD</IdLocation>
+<IndexLocation>^PerfTools.RanReadI</IndexLocation>
+<StreamLocation>^PerfTools.RanReadS</StreamLocation>
+<Data name="RandReadDefaultData">
+<Value name="1">
+<Value>%%CLASSNAME</Value>
+</Value>
+<Value name="2">
+<Value>RunDate</Value>
+</Value>
+<Value name="3">
+<Value>RunTime</Value>
+</Value>
+<Value name="4">
+<Value>DatabasePath</Value>
+</Value>
+<Value name="5">
+<Value>Processes</Value>
+</Value>
+<Value name="6">
+<Value>Iterations</Value>
+</Value>
+<Value name="7">
+<Value>DatabaseDirectory</Value>
+</Value>
+<Value name="8">
+<Value>ResponseTime</Value>
+</Value>
+<Value name="9">
+<Value>RunID</Value>
+</Value>
+<Value name="10">
+<Value>Batch</Value>
+</Value>
+<Value name="11">
+<Value>Database</Value>
+</Value>
+<Value name="12">
+<Value>Job</Value>
+</Value>
+<Value name="13">
+<Value>IOPS</Value>
+</Value>
+</Data>
+</Storage>
+</Class>
+</Export>
